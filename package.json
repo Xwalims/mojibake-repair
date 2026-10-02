@@ -1,0 +1,35 @@
+{
+  "name": "mojibake-repair",
+  "version": "0.1.0",
+  "description": "Detect and repair broken text encodings (mojibake) by hypothesising the original encoding and ranking the candidates. Zero dependencies.",
+  "main": "src/index.js",
+  "bin": {
+    "mojibake": "bin/mojibake.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "gen:tables": "node scripts/gen-tables.js"
+  },
+  "keywords": [
+    "mojibake",
+    "encoding",
+    "utf8",
+    "latin1",
+    "cp1251",
+    "cp1252",
+    "text",
+    "i18n",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "author": "Xwalims",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ]
+}
