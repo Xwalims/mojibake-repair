@@ -4,8 +4,19 @@ Detect and repair broken text encodings (mojibake) — by **hypothesising the
 original encoding and ranking the candidates**, never by guessing a single round
 trip. Zero dependencies, Node 20+.
 
+This package is **not published to npm** — the name is unregistered, so
+`npm install -g mojibake-repair` fails. Run it from a checkout:
+
+```console
+$ git clone https://github.com/Xwalims/mojibake-repair.git
+$ cd mojibake-repair
+$ node bin/mojibake.js --help
 ```
-npm install -g mojibake-repair      # or: node bin/mojibake.js
+
+Or link it onto your `PATH`:
+
+```console
+$ npm link          # provides the `mojibake` command
 ```
 
 ---
