@@ -275,6 +275,123 @@ test('--mixed appears in --help and the README documents it', () => {
   assert.match(readme, /--mixed/, 'README must document --mixed');
 });
 
+// The general form of the check above, so the next flag added without docs is
+// caught here rather than by a reader running --help and finding nothing.
+//
+// Both sides are collected with a lookbehind so the token is the flag itself:
+// a flag in code font arrives as "`--mixed", and without (?<!-) the tail of a
+// longer dash run matches too.
+const FLAG_RE = /(?<!-)(--[a-z][a-z0-9-]*)/g;
+
+/** Flags `--help` offers. `npm test` is a package script, not a CLI flag. */
+function helpFlags() {
+  const out = run(['--help']).stdout;
+  assert.ok(out.includes('--repair'), 'sanity: --help produced real output');
+  return new Set([...out.matchAll(FLAG_RE)].map((m) => m[1]).filter((f) => f !== '--test'));
+}
+
+test('every flag in --help is documented in the README', () => {
+  const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+  const documented = new Set([...readme.matchAll(FLAG_RE)].map((m) => m[1]));
+  for (const flag of helpFlags()) {
+    assert.ok(
+      documented.has(flag),
+      `--help offers ${flag}, which the README never mentions; a working flag ` +
+      'nobody can find in the docs is a shipped feature with no documentation',
+    );
+  }
+});
+
+test('the direction-4 check can actually fail', () => {
+  // The guard above has never gone red, which is not evidence. Strip every
+  // mention of one flag from a copy of the README and require the check to
+  // report it missing -- otherwise this is a test that cannot fail.
+  const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+  const stripped = readme.replace(/--mixed/g, '');
+  assert.notEqual(stripped, readme, 'sanity: stripping must change the README');
+
+  const documented = new Set([...stripped.matchAll(FLAG_RE)].map((m) => m[1]));
+  const missing = [...helpFlags()].filter((f) => !documented.has(f));
+  assert.ok(
+    missing.includes('--mixed'),
+    `expected the stripped README to lose --mixed, lost: ${JSON.stringify(missing)}`,
+  );
+});
+
+/**
+ * Flags the README documents, with the ones that belong to another tool dropped.
+ *
+ * Collected per line rather than over the whole document, because a README
+ * legitimately quotes commands from OTHER tools: `git diff --exit-code
+ * src/tables.js` in the Implementation notes section contributed `--exit-code`,
+ * and `npm test` contributes `--test`. My first version scanned the whole file
+ * and reported both as phantom mojibake flags -- the same false-positive class
+ * mdcheck and the other projects hit. Rule each out by looking at the line it
+ * came from, rather than by loosening the check.
+ */
+function readmeFlags() {
+  const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+  const flags = new Set();
+  for (const line of readme.split('\n')) {
+    // A line that starts by invoking another program is that program's command.
+    if (/^\s*[$#>]?\s*(git|npm|npx|pip|python3?|node|yarn|curl)\s/.test(line)) continue;
+    for (const m of line.matchAll(FLAG_RE)) flags.add(m[1]);
+  }
+  return flags;
+}
+
+test('every documented flag the parser accepts is really accepted', () => {
+  // Direction 1 for this project: the README must not promise a flag the parser
+  // rejects. Two tokens are deliberately NOT flags -- they are the usage-error
+  // demonstrations the exit-code section shows, and both are asserted as real
+  // usage errors elsewhere in this file. Naming them is the honest form: each
+  // entry is a deliberate example, not an oversight.
+  const DELIBERATE_EXAMPLES = new Set(['--nope', '--not-a-flag']);
+
+  for (const flag of readmeFlags()) {
+    if (DELIBERATE_EXAMPLES.has(flag)) continue;
+
+    // Existence, not behaviour: a flag that wants a value exits 2 with
+    // "requires a value" when run bare, which is NOT the same as "unknown
+    // option". Asserting a bare run exits 0 was my first attempt and it failed on
+    // --encoding -- the flag exists, it just needs an argument.
+    const bare = run([flag]);
+    assert.doesNotMatch(
+      bare.stderr,
+      /unknown option/,
+      `README documents ${flag}, which the parser rejects`,
+    );
+
+    const valued = run([flag, 'utf8']);
+    assert.doesNotMatch(
+      valued.stderr,
+      /unknown option/,
+      `README documents ${flag}, which the parser rejects`,
+    );
+  }
+});
+
+test('the README flag scan is not blind', () => {
+  // The filter that drops other tools' flags is a regex over lines, so it can
+  // silently start skipping real flag lines. Pin both halves: flags survive on
+  // ordinary prose lines, and a git/npm line is actually excluded.
+  assert.ok(readmeFlags().has('--mixed'), 'a real flag on a prose line must be seen');
+  assert.ok(readmeFlags().has('--repair'), 'sanity: the option table is read');
+  assert.equal(readmeFlags().has('--exit-code'), false, 'git diff --exit-code is not ours');
+  assert.equal(readmeFlags().has('--test'), false, 'npm test is not ours');
+  assert.ok(readmeFlags().size >= 8, `only saw ${readmeFlags().size} flags, which is implausibly few`);
+});
+
+test('every allowlisted fictional flag is still a real usage error', () => {
+  // Otherwise the allowlist above is a place to hide a genuinely broken flag:
+  // if --nope ever started parsing, this fails instead of silently passing.
+  for (const flag of ['--nope', '--not-a-flag']) {
+    const r = run([flag]);
+    assert.equal(r.status, EXIT.usage, `${flag} must be a usage error`);
+    assert.match(r.stderr, /unknown option/);
+  }
+});
+
 test('every --mixed output route exits 0 on a file-backed mixed document', () => {
   // Sweeps the routes with the real file input rather than stdin, since -o and
   // the file sniffer only engage there.
