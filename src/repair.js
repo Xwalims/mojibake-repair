@@ -22,6 +22,7 @@
 const { generateCandidates, STRATEGY_BY_ID, STRATEGY_IDS } = require('./candidates.js');
 const { looksMojibake, THRESHOLDS } = require('./detect.js');
 const { DEFAULT_MIN_SCORE, rankCandidates } = require('./score.js');
+const { splitLines, groupSegments, absorbUnchanged } = require('./segments.js');
 
 /**
  * Every option with its default, in one frozen object. Defaults live here and
@@ -294,10 +295,156 @@ function detect(text, options = {}) {
   return repair(text, Object.assign({}, options, { detectOnly: true }));
 }
 
+/**
+ * Repair a document whose lines broke through DIFFERENT codecs.
+ *
+ * `repair()` refuses such input and returns it untouched, which is correct: a
+ * single global hypothesis always destroys at least one part. But each line is
+ * independently repairable, and refusing the whole document throws away real
+ * data — the usual case being a French line served as cp1252 beside a Russian
+ * line served as cp1251.
+ *
+ * This decides per segment. Each run of lines gets its own winning codec, judged
+ * on that run alone, and a segment is only rewritten when its own repair is
+ * confident. Segments are grouped AFTER scoring, so a document alternating every
+ * line still collapses to two segments instead of one per line. A segment that
+ * would change nothing (pure ASCII breaks identically through every codec) adopts
+ * its neighbour's codec rather than fragmenting the document.
+ *
+ * The per-line contract of `repair()` is preserved: a segment that cannot be
+ * repaired confidently keeps its original bytes, so the worst case is the input
+ * unchanged — never worse.
+ *
+ * @param {string} text
+ * @param {Partial<typeof DEFAULTS>} [options]
+ * @returns {{
+ *   value: string,
+ *   original: string,
+ *   changed: boolean,
+ *   segments: ReadonlyArray<{encoding: string|null, lines: number, changed: boolean, reason: string}>,
+ *   repairedSegments: number,
+ *   refusedSegments: number,
+ *   reason: string
+ * }}
+ */
+function repairMixed(text, options = {}) {
+  const original = typeof text === 'string' ? text : String(text);
+  // detectOnly is honoured, NOT overridden. The per-segment decision needs the
+  // real repair to know which codec won each segment, but --detect-only must
+  // mean "decide and report, change nothing" -- which is why the segments are
+  // still computed and then discarded below rather than the option being forced
+  // off. Forcing it off (as an earlier draft did) made `--mixed --detect-only
+  // -o FILE` write repaired text while the report claimed nothing was changed.
+  const detectOnly = Boolean(options.detectOnly);
+  const opts = Object.assign({}, DEFAULTS, options, { detectOnly: false });
+
+  const lines = splitLines(original);
+  if (lines.length === 0) {
+    return Object.freeze({
+      value: original,
+      original,
+      changed: false,
+      segments: Object.freeze([]),
+      repairedSegments: 0,
+      refusedSegments: 0,
+      reason: 'empty input; nothing to repair',
+    });
+  }
+
+  // Decide each line on its own evidence, then group the decisions.
+  const decided = lines.map((line) => {
+    const result = repair(line.content, opts);
+    return {
+      content: line.content,
+      eol: line.eol,
+      id: result.confident && result.changed ? result.encoding : null,
+      value: result.confident && result.changed ? result.value : line.content,
+      reason: result.reason,
+    };
+  });
+
+  // An ASCII line repairs to itself under every codec, so its "winner" is
+  // arbitrary. Give those lines to their neighbours instead of letting them
+  // split the document into meaningless segments.
+  const grouped = absorbUnchanged(
+    groupSegments(decided).map((seg) => ({
+      id: seg.id,
+      lines: seg.lines,
+      unchanged: seg.id === null,
+    }))
+  );
+
+  const segments = [];
+  let out = '';
+  let repairedSegments = 0;
+  let refusedSegments = 0;
+
+  for (const seg of grouped) {
+    if (seg.id === null) {
+      // No confident codec for this run of lines: keep the original bytes.
+      refusedSegments += 1;
+      const text0 = seg.lines.map((l) => l.content + l.eol).join('');
+      segments.push({
+        encoding: null,
+        lines: seg.lines.length,
+        changed: false,
+        reason: 'no codec repaired this segment confidently; left unchanged',
+      });
+      out += text0;
+      continue;
+    }
+
+    // Re-run the whole segment under the codec that won for its lines. Scoring a
+    // segment as a unit rather than line by line is what makes a two-line French
+    // paragraph recoverable: one French line may not carry enough signal alone.
+    const raw = seg.lines.map((l) => l.content + l.eol).join('');
+    const joined = repair(raw, opts);
+    const useSegment =
+      joined.confident && joined.changed && joined.encoding === seg.id
+        ? joined.value
+        : seg.lines.map((l) => (l.id === seg.id ? l.value : l.content) + l.eol).join('');
+
+    if (useSegment !== raw) repairedSegments += 1;
+    segments.push({
+      encoding: seg.id,
+      lines: seg.lines.length,
+      changed: useSegment !== raw,
+      reason:
+        useSegment === raw
+          ? 'segment repaired to an identical value; left unchanged'
+          : `repaired as ${seg.id}`,
+    });
+    out += useSegment;
+  }
+
+  const changed = out !== original;
+  // The segments keep reporting what WOULD be done and under which codec, which
+  // is the entire point of --detect-only: the caller asked for a decision per
+  // segment, not a rewrite. Only `value` is withheld, and `changed` follows it,
+  // so no output path can write or announce text it was told not to touch.
+  return Object.freeze({
+    value: detectOnly ? original : out,
+    original,
+    changed: detectOnly ? false : changed,
+    segments: Object.freeze(segments),
+    repairedSegments,
+    refusedSegments,
+    reason: detectOnly
+      ? `would repair ${repairedSegments} of ${segments.length} segment(s) individually` +
+        (refusedSegments > 0 ? `, ${refusedSegments} refused` : '') +
+        '; --detect-only, text unchanged'
+      : changed
+        ? `repaired ${repairedSegments} of ${segments.length} segment(s) individually` +
+          (refusedSegments > 0 ? `, ${refusedSegments} refused` : '')
+        : 'no segment could be repaired confidently; returned unchanged',
+  });
+}
+
 module.exports = Object.freeze({
   DEFAULTS,
   ENCODINGS,
   STRATEGY_IDS,
   detect,
   repair,
+  repairMixed,
 });

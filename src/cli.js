@@ -19,7 +19,7 @@
 //   3  --require-change and nothing was broken enough to repair
 
 const fs = require('fs');
-const { DEFAULTS, ENCODINGS, repair } = require('./repair.js');
+const { DEFAULTS, ENCODINGS, repair, repairMixed } = require('./repair.js');
 const { STRATEGIES, STRATEGY_IDS } = require('./candidates.js');
 const { decodeFile, detectFileEncoding, ENCODINGS: FILE_ENCODINGS } = require('./detect-file.js');
 const { SIGNAL_WEIGHTS, THRESHOLDS } = require('./detect.js');
@@ -49,6 +49,7 @@ const OPTION_DEFAULTS = Object.freeze({
   failOnChange: false,
   requireChange: false,
   fileEncoding: null,
+  mixed: false,
   help: false,
   version: false,
 });
@@ -68,7 +69,11 @@ OPTIONS
   -o, --output FILE       write result to FILE (default: stdout)
       --repair            actually repair the text (default: detect only)
       --detect-only       force detection only, even if --repair was implied
-      --explain           print every candidate with its score
+      --explain            list every hypothesis with its score
+      --mixed              repair each run of lines under its own codec
+                          (implies --repair). For documents that broke through
+                          more than one encoding, where no single hypothesis
+                          can win.
       --encoding NAME     assume the misdecoding was NAME
                           (${ENCODINGS.join('|')}; default auto = try all)
       --min-score N       confidence threshold, 0..1 (default ${DEFAULT_MIN_SCORE})
@@ -189,6 +194,14 @@ function parseArgs(argv) {
       case '--explain':
         options.explain = true;
         break;
+      case '--mixed':
+        // Repair each run of lines under its own codec. Implies --repair,
+        // since reporting a per-segment verdict without changing anything is
+        // what --detect-only already does.
+        options.mixed = true;
+        options.repair = true;
+        options.detectOnly = false;
+        break;
       case '--json':
         options.json = true;
         break;
@@ -260,10 +273,44 @@ function formatReport(result, options, fileInfo) {
       }) -- ${fileInfo.reason}`
     );
   }
+  lines.push(`action: ${options.repair && !options.detectOnly ? 'repair' : 'detect only'}`);
+
+  // --mixed decides per segment, so there is no single detection verdict and no
+  // candidate ranking to print: a whole-document score would be a number about a
+  // document the tool deliberately did not treat as one document. The per-segment
+  // verdict IS the report.
+  if (result.segments) {
+    lines.push(`segments: ${result.segments.length}`);
+    if (result.changed) {
+      lines.push(`repaired: yes, ${result.repairedSegments} of ${result.segments.length} segment(s)`);
+    } else {
+      lines.push('repaired: no');
+    }
+    for (const [i, seg] of result.segments.entries()) {
+      const head = `  ${String(i + 1).padStart(2)}. `;
+      if (seg.encoding === null) {
+        lines.push(`${head}no codec    ${seg.lines} line(s) -- ${seg.reason}`);
+      } else {
+        lines.push(`${head}${seg.encoding.padEnd(12)}${seg.lines} line(s) -- ${seg.reason}`);
+      }
+    }
+    if (result.refusedSegments > 0) {
+      lines.push(`refused: ${result.refusedSegments} segment(s) left byte-identical`);
+    }
+    lines.push(`reason: ${result.reason}`);
+
+    if (options.explain && result.changed) {
+      lines.push('');
+      lines.push('--- repaired text ---');
+      lines.push(result.value);
+    }
+
+    return lines.join('\n');
+  }
+
   lines.push(`detected: ${result.detection.broken ? 'BROKEN' : 'clean'} (score ${result.detection.score})`);
   lines.push(`signals: ${result.detection.signals.length ? result.detection.signals.join(', ') : 'none'}`);
   lines.push(`why: ${result.detection.reason}`);
-  lines.push(`action: ${options.repair && !options.detectOnly ? 'repair' : 'detect only'}`);
 
   if (result.changed) {
     lines.push(`repaired: yes, as ${result.encoding} (score ${result.best.score.toFixed(3)})`);
@@ -323,29 +370,58 @@ function formatReport(result, options, fileInfo) {
  * @returns {string}
  */
 function formatJson(result, options, fileInfo) {
+  // --mixed returns a per-segment verdict, which is a different shape from
+  // repair()'s single-hypothesis result. The shared keys below (changed,
+  // reason, value, original) exist on both, so the report stays a superset
+  // rather than a different document: a caller parsing `changed` or `value`
+  // keeps working whichever mode produced it.
+  const common = {
+    input: options.input,
+    fileEncoding: fileInfo
+      ? {
+          encoding: fileInfo.encoding,
+          bom: fileInfo.bom,
+          confidence: fileInfo.confidence,
+          reason: fileInfo.reason,
+        }
+      : null,
+    mixed: Boolean(result.segments),
+    changed: result.changed,
+    reason: result.reason,
+    value: result.value,
+    original: result.original,
+  };
+
+  if (result.segments) {
+    return JSON.stringify(
+      Object.assign(common, {
+        segments: result.segments,
+        repairedSegments: result.repairedSegments,
+        refusedSegments: result.refusedSegments,
+        // A mixed report has no single encoding and no ranking. Emitting null
+        // rather than omitting the keys keeps the shape stable for a caller
+        // that reads `encoding` unconditionally.
+        confident: result.segments.every((s) => s.encoding !== null),
+        encoding: null,
+        detection: null,
+        candidates: [],
+      }),
+      null,
+      2
+    );
+  }
+
   return JSON.stringify(
-    {
-      input: options.input,
-      fileEncoding: fileInfo
-        ? {
-            encoding: fileInfo.encoding,
-            bom: fileInfo.bom,
-            confidence: fileInfo.confidence,
-            reason: fileInfo.reason,
-          }
-        : null,
+    Object.assign(common, {
+      mixed: false,
       detection: {
         broken: result.detection.broken,
         score: result.detection.score,
         signals: result.detection.signals,
         reason: result.detection.reason,
       },
-      changed: result.changed,
       confident: result.confident,
       encoding: result.encoding,
-      reason: result.reason,
-      value: result.value,
-      original: result.original,
       candidates: result.candidates.map((c) => ({
         encoding: c.assumed,
         id: c.id,
@@ -362,7 +438,7 @@ function formatJson(result, options, fileInfo) {
         suspect: THRESHOLDS.suspect,
         repairDefault: DEFAULTS.minScore,
       },
-    },
+    }),
     null,
     2
   );
@@ -412,11 +488,21 @@ async function main(argv) {
   }
   const fileInfo = sniffed;
 
-  const result = repair(text, {
-    minScore: options.minScore,
-    encoding: options.encoding,
-    detectOnly: options.detectOnly,
-  });
+  // --mixed picks a codec per run of lines instead of one global hypothesis.
+  // It does not weaken repair(): that function still refuses a mixed document
+  // when no single codec explains it, and repairMixed() only ever rewrites a
+  // segment it can repair confidently.
+  const result = options.mixed
+    ? repairMixed(text, {
+        minScore: options.minScore,
+        encoding: options.encoding,
+        detectOnly: options.detectOnly,
+      })
+    : repair(text, {
+        minScore: options.minScore,
+        encoding: options.encoding,
+        detectOnly: options.detectOnly,
+      });
 
   // Whether the tool is being asked to change the text, used for output routing.
   const repairing = options.repair && !options.detectOnly;

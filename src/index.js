@@ -3,7 +3,7 @@
 // Public API. The CLI in src/cli.js is the user-facing surface; this is the
 // programmatic one.
 
-const { repair, detect, DEFAULTS, ENCODINGS } = require('./repair.js');
+const { repair, repairMixed, detect, DEFAULTS, ENCODINGS } = require('./repair.js');
 const { looksMojibake, analyse, measure, THRESHOLDS } = require('./detect.js');
 const { detectFileEncoding, decodeFile } = require('./detect-file.js');
 const {
@@ -31,5 +31,6 @@ module.exports = Object.freeze({
   measure,
   rankCandidates,
   repair,
+  repairMixed,
   scoreCandidate,
 });

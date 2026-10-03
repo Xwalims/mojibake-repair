@@ -216,7 +216,7 @@ mojibake: unknown option "--nope"
 ## CLI
 
 ```
-mojibake [-i FILE] [-o FILE] [--repair] [--detect-only] [--explain]
+mojibake [-i FILE] [-o FILE] [--repair] [--detect-only] [--explain] [--mixed]
          [--encoding utf8|latin1|cp1251|cp1252|auto] [--min-score N]
          [--file-encoding NAME] [--json] [--quiet]
          [--fail-on-change] [--require-change] [--version] [--help]
@@ -228,7 +228,8 @@ mojibake [-i FILE] [-o FILE] [--repair] [--detect-only] [--explain]
 | `-o, --output FILE` | Write the text to FILE (always UTF-8) |
 | `--repair` | Actually repair. Detection is the default |
 | `--detect-only` | Force detection, even if `--repair` was given |
-| `--explain` | Print every candidate with its score and reasoning |
+| `--explain` | List every hypothesis with its score and reasoning |
+| `--mixed` | Repair each run of lines under its own codec (implies `--repair`) |
 | `--encoding NAME` | Assume the misdecoding was NAME (`auto` = try all) |
 | `--min-score N` | Confidence threshold, 0..1 (default `0.6`) |
 | `--file-encoding NAME` | Decode the input file as NAME (default: sniff) |
@@ -355,16 +356,62 @@ module instances.
 Both are deliberate refusals rather than silent corruption, and both are pinned
 by tests.
 
-**Mixed-encoding documents are refused.** A document whose lines broke
-differently cannot be repaired by any single global encoding — French needs
-cp1252 for byte `0x87`, Russian through latin1 contains `0x9F` which cp1252
-remaps. Every hypothesis destroys at least one byte, so the tool returns the
-original and says why, rather than silently corrupting one line.
+**A document broken through more than one codec is refused by default.** A
+document whose lines broke differently cannot be repaired by any single global
+encoding — French needs cp1252 for byte `0x87`, Russian through latin1 contains
+`0x9F` which cp1252 remaps. Every hypothesis destroys at least one byte, so the
+tool returns the original and says why, rather than silently corrupting one line.
+[`--mixed`](#the-document-that-broke-twice) recovers this case segment by segment,
+but only on request, so the safe default stays safe.
 
 **Residual `U+FFFD` may be retained.** When the input was already lossy and the
 only recoverable hypothesis is lossy too, the repair goes ahead provided it does
 not *increase* the replacement-character count. That rule is relative, so it is
 never looser than "no `U+FFFD` may be introduced".
+
+---
+
+## The document that broke twice
+
+The commonest real mojibake is not a whole file mislabelled — it is *part* of a
+file. A French paragraph served as cp1251 beside a Russian one served as
+cp1252, or an export pipeline that concatenated records from two systems.
+
+```console
+$ mojibake --mixed -i mixed.txt
+input: mixed.txt
+file encoding: utf8 (confidence 0.9714) -- decodes as well-formed UTF-8 including non-ASCII bytes
+action: repair
+segments: 3
+repaired: yes, 3 of 3 segment(s)
+   1. latin1      1 line(s) -- repaired as latin1
+   2. cp1251      1 line(s) -- repaired as cp1251
+   3. latin1      1 line(s) -- repaired as latin1
+reason: repaired 3 of 3 segment(s) individually
+```
+
+Each run of consecutive lines is judged on its own evidence and gets its own
+winning codec. Three details matter:
+
+- **Grouping happens after scoring, not before.** Lines are decided individually
+  and runs of the same winner are merged, so a paragraph broken through one codec
+  stays one segment instead of one segment per line.
+- **A segment is only rewritten when its own repair is confident.** A run of
+  lines that no single codec explains is left byte-identical and reported as
+  refused. The worst case is the input unchanged — never worse.
+- **ASCII lines adopt a neighbour.** Pure ASCII breaks identically through every
+  codec, so its "winner" is arbitrary; those lines join the neighbouring segment
+  instead of fragmenting the document.
+
+`--mixed` is additive, not a fix. Without it the same file is still refused
+byte-identical, and `repair()`'s refusal is what the default path depends on.
+
+With `--detect-only` every segment is still decided and reported — that is the
+point of the flag — but nothing is written and nothing is emitted, so
+`--mixed --detect-only -o FILE` copies the input rather than rewriting it.
+`--json` reports the same per-segment verdict as `segments[]`, with
+`repairedSegments` / `refusedSegments` counters and `encoding: null`, since a
+mixed document has no single answer.
 
 ---
 
@@ -407,7 +454,7 @@ reads it as big-endian.
 npm test        # node --test
 ```
 
-296 tests across 9 files, built on `node:test` and `node:assert` with no test
+338 tests across 11 files, built on `node:test` and `node:assert` with no test
 framework. Broken samples are **generated** by encoding correct text through the
 wrong codec, so every true-positive test is self-proving: the expected value is
 the original string, and a test can only pass if the tool reverses the same
