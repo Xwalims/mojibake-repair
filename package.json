@@ -29,6 +29,8 @@
   "files": [
     "bin",
     "src",
+    "spec",
+    "scripts",
     "README.md",
     "LICENSE"
   ]

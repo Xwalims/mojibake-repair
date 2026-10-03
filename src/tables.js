@@ -2,15 +2,19 @@
 
 // Byte -> code point tables for the two legacy single-byte codecs we need.
 //
-// Node's Buffer only implements utf8/latin1/ucs2/etc. TextDecoder *decodes*
-// windows-1251 and windows-1252 (they are part of the WHATWG Encoding Standard
-// and Node ships them), but it cannot *encode* them. Mojibake repair needs both
+// Node's Buffer only implements utf8/latin1/ucs2, and neither it nor
+// TextDecoder can *encode* windows-1251/1252. Mojibake repair needs both
 // directions, so we vendor the tables.
 //
-// These exact 256-entry arrays were generated from Node's own TextDecoder by
-// scripts/gen-tables.js, which performs the WHATWG single-byte decode step.
-// They are therefore the WHATWG tables, not a hand-typed approximation. Re-run
-// `node scripts/gen-tables.js` to regenerate them after a Node upgrade.
+// These exact 256-entry arrays were generated from the WHATWG Encoding
+// Standard's own index files, vendored verbatim in spec/ (provenance and
+// licence in spec/README.md). They are therefore the standard's tables, not a
+// hand-typed approximation. Re-run `node scripts/gen-tables.js` to regenerate
+// them after a spec update.
+//
+// The oracle is the standard, deliberately NOT TextDecoder: Node 20's ICU
+// decodes windows-1252 as ISO-8859-1 (0x80 -> U+0080, not U+20AC), so deriving
+// these from the runtime would turn 32 correct bytes into a latin1 identity map.
 
 // windows-1251 (Cyrillic): byte value -> code point.
 const CP1251 = [

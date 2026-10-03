@@ -26,7 +26,7 @@ jobs:
       - name: Confirm there are no dependencies to install
         run: node -e "const p=require('./package.json'); const d=Object.keys(p.dependencies||{}).length+(Object.keys(p.devDependencies||{}).length); if(d) { console.error('expected zero dependencies, found '+d); process.exit(1) } console.log('zero dependencies confirmed')"
 
-      - name: Confirm the vendored codec tables match the WHATWG reference
+      - name: Confirm the vendored codec tables match the WHATWG index files
         run: node scripts/gen-tables.js && git diff --exit-code src/tables.js
 
       - name: Run the test suite

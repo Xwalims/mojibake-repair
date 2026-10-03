@@ -370,18 +370,27 @@ never looser than "no `U+FFFD` may be introduced".
 
 ## Implementation notes
 
-`Buffer` implements only utf8/latin1/ucs2. `TextDecoder` *decodes*
-windows-1251/1252 (they are in the WHATWG Encoding Standard and Node ships them)
-but cannot *encode* them. Mojibake repair needs both directions, so
-`src/tables.js` vendors the two 256-entry tables — **generated from Node's own
-`TextDecoder`**, not hand-typed:
+`Buffer` implements only utf8/latin1/ucs2, so mojibake repair needs its own
+byte -> code point tables. `src/tables.js` vendors the two 256-entry tables
+(encoding is required as well as decoding, which `Buffer` cannot do), and they
+are generated from the **WHATWG Encoding Standard's own index files**, vendored
+verbatim in [`spec/`](spec/):
 
 ```
 node scripts/gen-tables.js && git diff --exit-code src/tables.js
 ```
 
 CI runs that check on every Node version, so the tables cannot silently drift
-from the reference implementation.
+from the standard.
+
+The oracle is deliberately *not* `TextDecoder`. Node is an implementation of the
+standard, not the standard, and Node 20 gets windows-1252 wrong: its ICU decodes
+the C1 block as ISO-8859-1, so `0x80` becomes `U+0080` instead of `U+20AC`.
+Generating tables from that runtime silently rewrites 32 correct bytes into a
+latin1 identity map — a correct library turned wrong by a `node --version`
+upgrade. `spec/index-windows-1251.txt` and `spec/index-windows-1252.txt` are
+version-independent, and their upstream `Identifier:` headers are asserted by the
+test suite so a hand-edited `spec/` cannot make the check pass.
 
 `detect-file.js` works on the **Buffer**, never a decoded string — `toString('utf8')`
 substitutes `U+FFFD`, so a "does this contain NUL?" test run after decoding gives
@@ -398,7 +407,7 @@ reads it as big-endian.
 npm test        # node --test
 ```
 
-295 tests across 9 files, built on `node:test` and `node:assert` with no test
+296 tests across 9 files, built on `node:test` and `node:assert` with no test
 framework. Broken samples are **generated** by encoding correct text through the
 wrong codec, so every true-positive test is self-proving: the expected value is
 the original string, and a test can only pass if the tool reverses the same

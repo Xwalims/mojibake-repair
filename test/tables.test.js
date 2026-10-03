@@ -1,20 +1,41 @@
 'use strict';
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 const { CP1251, CP1252, REVERSE_CP1251, REVERSE_CP1252, buildReverse } = require('../src/tables.js');
 
-// The vendored tables must agree byte-for-byte with Node's own WHATWG
-// implementation, otherwise every repair built on them is a guess.
-for (const [name, table] of [['windows-1251', CP1251], ['windows-1252', CP1252]]) {
-  test(`tables: ${name} matches TextDecoder for all 256 bytes`, () => {
-    const decoder = new TextDecoder(name, { fatal: true });
+/**
+ * The normative WHATWG index, parsed from spec/. This is the oracle, NOT
+ * TextDecoder: Node 20's ICU decodes windows-1252 as ISO-8859-1 (0x80 -> U+0080
+ * instead of U+20AC), so agreeing with the runtime would mean shipping the wrong
+ * table on whichever Node version the machine happens to have.
+ * @param {string} file index file name in spec/
+ * @returns {number[]} 128 code points for bytes 0x80-0xFF
+ */
+function whatwgIndex(file) {
+  const text = fs.readFileSync(path.join(__dirname, '..', 'spec', file), 'utf8');
+  const rows = [];
+  for (const line of text.split('\n')) {
+    const match = /^\s*(\d+)\s+0x([0-9A-Fa-f]+)\s/.exec(line);
+    if (match) rows.push(Number('0x' + match[2]));
+  }
+  assert.equal(rows.length, 128, `${file}: expected 128 index rows`);
+  return rows;
+}
+
+const SPEC = [
+  ['windows-1251', CP1251, 'index-windows-1251.txt'],
+  ['windows-1252', CP1252, 'index-windows-1252.txt'],
+];
+
+// The vendored tables must agree with the standard byte for byte, otherwise
+// every repair built on them is a guess.
+for (const [name, table, file] of SPEC) {
+  test(`tables: ${name} matches the WHATWG index for all 256 bytes`, () => {
+    const index = whatwgIndex(file);
     for (let byte = 0; byte < 256; byte++) {
-      let expected = null;
-      try {
-        expected = decoder.decode(Uint8Array.of(byte)).codePointAt(0);
-      } catch {
-        expected = null;
-      }
+      const expected = byte < 0x80 ? byte : index[byte - 0x80];
       assert.equal(
         table[byte],
         expected,
@@ -23,6 +44,25 @@ for (const [name, table] of [['windows-1251', CP1251], ['windows-1252', CP1252]]
     }
   });
 }
+
+test('tables: the vendored index files are the unmodified WHATWG ones', () => {
+  // Guards against someone hand-editing spec/ to make a table check pass.
+  // The identifiers are the ones upstream published with these files.
+  const identifiers = {
+    'index-windows-1251.txt':
+      '7592ef921679ba168b00a9e9afa3b4eebd67bf13dc7e84c4b6e120de856826e0',
+    'index-windows-1252.txt':
+      'e56d49d9176e9a412283cf29ac9bd613f5620462f2a080a84eceaf974cfa18b7',
+  };
+  for (const [file, id] of Object.entries(identifiers)) {
+    const text = fs.readFileSync(path.join(__dirname, '..', 'spec', file), 'utf8');
+    assert.match(
+      text,
+      new RegExp(`^# Identifier: ${id}$`, 'm'),
+      `${file}: upstream Identifier header is missing or changed`
+    );
+  }
+});
 
 test('tables: every entry is a code point or null', () => {
   for (const table of [CP1251, CP1252]) {

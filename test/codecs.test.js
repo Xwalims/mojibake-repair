@@ -37,15 +37,34 @@ test('codecs: normalizeCodec rejects an unknown name loudly', () => {
   assert.throws(() => normalizeCodec('shift_jis'), /unknown encoding/);
 });
 
-test('codecs: decode matches TextDecoder for windows-1251 and windows-1252', () => {
-  // Node's TextDecoder is the WHATWG reference implementation; our vendored
-  // tables must agree with it byte for byte.
-  for (const [name, table] of [['cp1251', CP1251], ['cp1252', CP1252]]) {
-    const reference = new TextDecoder(`windows-${name.slice(2)}`, { fatal: false });
+test('codecs: decode matches the WHATWG index for windows-1251 and windows-1252', () => {
+  // The oracle is the standard's own index file (parsed by test/tables.test.js's
+  // sibling helper), not TextDecoder: Node 20 decodes windows-1252 as
+  // ISO-8859-1, so an agreement check against the runtime would only certify
+  // that the runtime is self-consistent.
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const index = (file) => {
+    const rows = [];
+    const text = fs.readFileSync(path.join(__dirname, '..', 'spec', file), 'utf8');
+    for (const line of text.split('\n')) {
+      const m = /^\s*(\d+)\s+0x([0-9A-Fa-f]+)\s/.exec(line);
+      if (m) rows.push(Number('0x' + m[2]));
+    }
+    assert.equal(rows.length, 128, `${file}: expected 128 index rows`);
+    return rows;
+  };
+
+  for (const [name, file] of [
+    ['cp1251', 'index-windows-1251.txt'],
+    ['cp1252', 'index-windows-1252.txt'],
+  ]) {
+    const rows = index(file);
     for (let byte = 0; byte < 256; byte++) {
+      const cp = byte < 0x80 ? byte : rows[byte - 0x80];
       assert.equal(
         decode(Buffer.of(byte), name),
-        reference.decode(Uint8Array.of(byte)),
+        String.fromCodePoint(cp),
         `${name} byte 0x${byte.toString(16)}`
       );
     }
