@@ -19,7 +19,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const test = require('node:test');
+const { after, test } = require('node:test');
 const { spawnSync } = require('node:child_process');
 
 const { mojibake } = require('../src/codecs.js');
@@ -36,9 +36,33 @@ const DE = 'Größe, Straße, weiß';
 const MIXED_BROKEN = [mojibake(FR, 'latin1'), mojibake(RU, 'cp1251'), mojibake(DE, 'latin1')].join('\n') + '\n';
 const MIXED_CORRECT = `${FR}\n${RU}\n${DE}\n`;
 
+/**
+ * A scratch directory that every spawned CLI runs INSIDE, so a flag that takes a
+ * filename cannot write into the repository.
+ *
+ * The direction-1 sweep below proves a documented flag is accepted by running
+ * `mojibake <flag> utf8` -- 'utf8' being a stand-in VALUE for any flag that
+ * wants one. For --output (and -o) that value is a PATH, so the tool did exactly
+ * what a shell would do and created a file literally named `utf8` in the repo
+ * root. It was empty, because the sweep feeds no input, and it was invisible:
+ * the file had already been committed once, so every later run recreated byte
+ * identical content and `git status` stayed clean. Only the mtime moved.
+ *
+ * The CLI was right; the harness was wrong. Spawning in a temp dir fixes the
+ * whole CLASS rather than this one flag, so any future value-taking flag that
+ * writes a file is also contained.
+ */
+const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'mojibake-cwd-'));
+const REPO_ROOT = path.join(__dirname, '..');
+after(() => fs.rmSync(SCRATCH, { recursive: true, force: true }));
+
 /** @returns {{status: number, stdout: string, stderr: string}} */
 function run(args = [], stdin = '') {
-  const r = spawnSync(process.execPath, [BIN, ...args], { input: stdin, encoding: 'utf8' });
+  const r = spawnSync(process.execPath, [BIN, ...args], {
+    input: stdin,
+    encoding: 'utf8',
+    cwd: SCRATCH,
+  });
   return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
 }
 
@@ -368,6 +392,38 @@ test('every documented flag the parser accepts is really accepted', () => {
       /unknown option/,
       `README documents ${flag}, which the parser rejects`,
     );
+  }
+});
+
+test('the README flag sweep cannot write into the repository', () => {
+  // The regression this pins is not a crash, it is a leak. The sweep above runs
+  // `mojibake <flag> utf8`, so for --output that 'utf8' is a PATH and the tool
+  // created a file named `utf8` in the repo root on every run. It stayed
+  // invisible for a day and a half: the file was committed, so each run rewrote
+  // it with identical bytes and `git status` reported nothing. Only the mtime
+  // moved. A test that merely passes green cannot catch that class.
+  //
+  // So this asserts the containment directly, from the outside: run the sweep's
+  // own worst-case flag and require that NOTHING appeared in the repo root, and
+  // that the write landed in the scratch cwd instead. Deleting the stray file
+  // would hide it; leaving the test as "the suite is green" hid it already.
+  const before = new Set(fs.readdirSync(REPO_ROOT));
+  try {
+    const r = run(['--output', 'utf8'], MIXED_BROKEN);
+    assert.doesNotMatch(r.stderr, /unknown option/, '--output must accept a value');
+
+    const leaked = fs.readdirSync(REPO_ROOT).filter((n) => !before.has(n));
+    assert.deepEqual(
+      leaked,
+      [],
+      `the CLI wrote into the repository: ${JSON.stringify(leaked)}`,
+    );
+    assert.ok(
+      fs.existsSync(path.join(SCRATCH, 'utf8')),
+      'sanity: the write must be contained in the scratch cwd, not merely suppressed',
+    );
+  } finally {
+    fs.rmSync(path.join(SCRATCH, 'utf8'), { force: true });
   }
 });
 

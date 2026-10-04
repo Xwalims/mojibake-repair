@@ -11,7 +11,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const test = require('node:test');
+const { after, test } = require('node:test');
 const { spawnSync } = require('node:child_process');
 
 const { mojibake } = require('../src/codecs.js');
@@ -21,16 +21,30 @@ const { CORRECT } = require('./fixtures.js');
 const BIN = path.join(__dirname, '..', 'bin', 'mojibake.js');
 const { version } = require('../package.json');
 
+/** Scratch cwd for every spawned CLI, so a relative output path cannot escape. */
+const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'mojibake-cli-cwd-'));
+after(() => fs.rmSync(SCRATCH, { recursive: true, force: true }));
+
 /**
  * Run the real CLI.
+ *
+ * `cwd` is a scratch dir on purpose. Every path argument this file passes today
+ * is absolute, so nothing leaks today -- but a relative path is exactly what a
+ * `-o somefile` caller types, so the harness must not depend on that staying
+ * true. A leaked write is invisible in this repo: a file committed once is
+ * recreated with identical content on every later run and `git status` stays
+ * clean while only its mtime moves. See the same guard in mixed-cli.test.js,
+ * where --output actually did leak one.
+ *
  * @param {readonly string[]} args
  * @param {{ input?: string }} [options] stdin content
- * @returns {{ status: number, stdout: string, stderr: string }}
+ * @returns {{ status: number, stdout: string, stderr: string } }
  */
 function run(args = [], options = {}) {
   const result = spawnSync(process.execPath, [BIN, ...args], {
     input: options.input === undefined ? '' : options.input,
     encoding: 'utf8',
+    cwd: SCRATCH,
   });
   return {
     status: result.status,
