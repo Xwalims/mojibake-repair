@@ -143,14 +143,35 @@ function repair(text, options = {}) {
   // When the input is undamaged the two counts are equal at worst, so this is
   // never looser than the original absolute rule.
   const introducedFffd = countFffd(winner.value) - countFffd(original);
-  const acceptable = introducedFffd <= 0;
 
-  if (!acceptable) {
+  // U+003F substitution is a different kind of loss and gets an ABSOLUTE veto,
+  // here as well as in the scorer. `score.js` floors any substituting candidate
+  // at 0.000, which keeps it out of the pool at the default minScore of 0.6 --
+  // but `--min-score 0` is a documented flag, and pickWinner()'s lossy fallback
+  // ignores `eligible` entirely. Without a check here,
+  //
+  //   mojibake --repair --encoding cp1251 --min-score 0
+  //
+  // returned "e????g ????P??e??h??7K??Cg_x??" for a 21-character document and
+  // reported success, having destroyed 18 of the 30 input code points with zero
+  // U+FFFD to show for it. The scorer alone is not a veto; the winner has to be
+  // checked here, where refusing is still an option.
+  //
+  // Relative would be wrong, as documented in the README: "how many rows?" is
+  // ordinary text, so comparing counts cannot tell a real question mark from one
+  // the codec manufactured, and the returned value carries no trace of which was
+  // which.
+  const substituted = Number.isInteger(winner.substitutedChars) ? winner.substitutedChars : 0;
+  const lostSubstitutions = substituted > 0;
+
+  if (introducedFffd > 0 || lostSubstitutions) {
     return finish(original, original, false, false, null, candidates, detection, opts, {
       detection,
-      reason:
-        `best candidate ${winner.id} scored ${winner.score.toFixed(3)} but would ` +
-        `introduce ${introducedFffd} replacement char(s) and lose data; returned unchanged`,
+      reason: bestFailureReason(candidates, opts, {
+        winner,
+        introducedFffd,
+        substituted,
+      }),
     });
   }
 
@@ -234,20 +255,47 @@ function strategyAssumes(id, encoding) {
  * Explain, in one sentence, why nothing was repaired. Picks the most informative
  * failure across the candidate pool.
  *
+ * `veto` is supplied when a candidate WAS selected and then refused by the
+ * data-loss rules, so the message names the actual rule that fired. Without it
+ * the reason is inferred from the top of the pool, which is misleading when the
+ * pool was narrowed (`--encoding`) and the top of it is the very candidate that
+ * was just refused: that produced "introduced 0 replacement chars and would lose
+ * data" for a refusal that had nothing to do with replacement characters.
+ *
  * @param {ReadonlyArray<object>} candidates
  * @param {typeof DEFAULTS} opts
+ * @param {{winner: object, introducedFffd: number, substituted: number}} [veto]
  * @returns {string}
  */
-function bestFailureReason(candidates, opts) {
+function bestFailureReason(candidates, opts, veto) {
   const usable = candidates.filter((c) => c.value !== null);
   if (usable.length === 0) {
     return 'no candidate could be generated for this text; returned unchanged';
   }
+
+  if (veto) {
+    const { winner, introducedFffd, substituted } = veto;
+    const losses = [];
+    if (introducedFffd > 0) losses.push(`${introducedFffd} replacement char(s)`);
+    if (substituted > 0) {
+      losses.push(`${substituted} character(s) its codec cannot represent, substituted with '?'`);
+    }
+    return (
+      `best candidate ${winner.id} scored ${winner.score.toFixed(3)} but would lose data: ` +
+      `${losses.join(' and ')}; returned unchanged`
+    );
+  }
+
   const top = usable[0];
   if (!top.eligible) {
+    const losses = [];
+    if (top.parts.replacementChars) losses.push(`${top.parts.replacementChars} replacement chars`);
+    if (top.substitutedChars) {
+      losses.push(`${top.substitutedChars} substituted chars`);
+    }
     return (
-      `best candidate (${top.id}, score ${top.score.toFixed(3)}) introduced ` +
-      `${top.parts.replacementChars} replacement chars and would lose data; returned unchanged`
+      `best candidate (${top.id}, score ${top.score.toFixed(3)}) lost data: ` +
+      `${losses.join(' and ')}; returned unchanged`
     );
   }
   if (!top.changed) {

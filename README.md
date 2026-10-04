@@ -329,16 +329,63 @@ The lead range covers **2, 3 and 4-byte** UTF-8 sequences (`U+00C2–U+00F4`). A
 ## How repair is ranked
 
 Every hypothesis is generated, scored independently, and ranked. A candidate that
-introduced a `U+FFFD` is **disqualified**, not merely penalised — bytes thrown
-away can never come back.
+destroyed a character is **disqualified**, not merely penalised — thrown-away bytes
+can never come back. "Destroyed" counts in two forms, and both are vetoes:
 
 | Weight | Component | Why |
 | --- | --- | --- |
-| −100 | replacement chars | Data loss. Disqualified, not scored |
+| −100 | replacement chars | `U+FFFD`: a byte that could not be decoded. Disqualified, not scored |
+| −100 | substituted chars | `U+003F`: a character the codec could not represent. Disqualified, not scored |
 | +30 | script consistency | Russian must not read as a Latin/Cyrillic mix. Hard to game by shortening |
 | +25 | artefact density | Counts both byte pairs **and** cp1251 padding letters; a repair drives it to zero |
 | +15 | printable ratio | Catches control characters and symbol soup |
 | +12 | language hint | Small frequency bonus. Breaks ties; **never** carries a decision |
+
+The second veto exists because the lossy encoder substitutes `U+003F QUESTION MARK`
+for any code point a codec cannot hold, and `?` is a perfectly printable ASCII
+character. Scored on `U+FFFD` alone, the most destructive candidate in the pool
+scored *best*: a fully `?`-substituted value has no artefacts, one coherent script
+and 100% printable, so it beat the lossless answer every time.
+
+```console
+$ printf '\145\303\203\302\275\303\203\302\234\147\040\303\203\302\270\303\203\302\221\120\303\203\302\212\145\303\202\302\245\150\303\203\302\205\067\113\303\203\302\206\103\147\137\170\303\203\302\221' > t.txt
+$ mojibake -i t.txt --repair
+eýÜg øÑPÊe¥hÅ7KÆCg_xÑ
+```
+
+That file holds 30 code points. The `utf8-as-cp1251` hypothesis substituted 18 of
+them with `?`, zero `U+FFFD`, and scored `0.902` against the lossless answer's
+`0.854`. Before the substitution count was scored, that same command printed
+
+```
+e????g ????P??e??h??7K??Cg_x??
+```
+
+and reported no data loss. Only one of the 18 substitutions is a character that
+survived the breakage intact — `¥`. The other 17 are the `Ã½`-style artefacts the
+breakage itself produced, which the wrong hypothesis then discarded along with
+the text.
+
+The substitution count is measured **at the encode step**, by the code that knows
+which codec it is using (`countSubstitutions()` in `src/codecs.js`). It cannot be
+recovered afterwards: once the characters have become `?`, the damaged text is
+indistinguishable from a document that really contained question marks. Each
+candidate therefore carries its own `substitutedChars` count, and `eligible`
+requires it to be zero.
+
+**The veto is checked twice, and the second check is the one that matters.** The
+score term alone is not enough. It floors a substituting candidate at `0.000`,
+which keeps it out of the pool at the default `--min-score 0.6` — but `--min-score 0`
+is a documented flag, and the lossy fallback that runs when *nothing* lossless
+qualifies deliberately ignores `eligible`. So `repair()` re-checks the chosen winner
+and refuses:
+
+```console
+$ mojibake -i t.txt --repair --encoding cp1251 --min-score 0
+eÃ½Ãg Ã¸ÃPÃeÂ¥hÃ7KÃCg_xÃ
+$ mojibake -i t.txt --repair --encoding cp1251 --min-score 0 --json | grep '"reason"'
+  "reason": "best candidate utf8-as-cp1251 scored 0.000 but would lose data: 18 character(s) its codec cannot represent, substituted with '?'; returned unchanged",
+```
 
 Counting cp1251 padding letters alongside byte pairs is essential: without them a
 cp1251 repair scores *zero* progress, because the broken and repaired forms are
@@ -368,6 +415,18 @@ but only on request, so the safe default stays safe.
 only recoverable hypothesis is lossy too, the repair goes ahead provided it does
 not *increase* the replacement-character count. That rule is relative, so it is
 never looser than "no `U+FFFD` may be introduced".
+
+The same relative rule does **not** extend to `?` substitutions, and that is
+deliberate. A `U+003F` can legitimately occur in ordinary text ("how many
+rows?"), so a *relative* count against the input cannot distinguish a real
+question mark from one the codec manufactured — and the result text carries no
+trace of which was which. Counting it relatively would therefore let a
+hypothesis substitute `?` for characters the document really contained. So the
+substitution veto is absolute: any candidate that substitutes a single character
+is disqualified, and if only such candidates remain the text is returned
+unchanged. The documented lossy-repair path above remains available for input
+that was already damaged, because those cases arrive carrying `U+FFFD`, which is
+unambiguous.
 
 ---
 

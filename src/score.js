@@ -20,6 +20,15 @@
 //     applied as a hard filter in `isEligible` and the penalty exists only to
 //     order the display of candidates in --explain.
 //
+//     SUBSTITUTED CHARS (-100, disqualifying) is the same veto for the other
+//     silent loss. encode() replaces a code point its codec cannot hold with
+//     U+003F, which is a perfectly printable ASCII character, so the damage is
+//     invisible in the result. Left uncounted it made the score actively prefer
+//     the candidate that deletes the most text: a fully '?'-substituted value
+//     has no artefacts, one coherent script and 100% printable, so it outscored
+//     the lossless answer. The count has to be supplied by the caller, which is
+//     the only place the codec is known.
+//
 //  2. SCRIPT CONSISTENCY  (+30)
 //     Broken UTF-8-as-latin1 text is a mix of Latin letters and stray symbols;
 //     the repaired text is one coherent script. This is the single most
@@ -59,6 +68,7 @@ const { CONTINUATION, isC1, isLead, scanPairs } = require('./structure.js');
 /** Weights. Exported so the CLI can print them and tests can assert them. */
 const WEIGHTS = Object.freeze({
   replacementChars: -100, // disqualifying in practice; see `eligible`
+  substitutedChars: -100, // likewise; see the note in scoreCandidate()
   scriptConsistency: 30,
   artefactDensity: 25,
   printableRatio: 15,
@@ -266,13 +276,24 @@ function languageHint(text) {
  *   hints: string[], hintRatio: number, dominantScript: string|null
  * }}
  */
-function scoreCandidate(value, original) {
+function scoreCandidate(value, original, options = {}) {
   const text = String(value);
   const m = measure(text);
   const scripts = scriptConsistency(text);
   const printable = printableRatio(text);
   const artefacts = artefactDensity(text);
   const hint = languageHint(text);
+
+  // Characters the generating codec could not represent and silently replaced
+  // with U+003F. Passed in by the caller, which is the only place the codec is
+  // known; counted as damage for exactly the same reason U+FFFD is.
+  //
+  // This is not cosmetic. U+003F is a printable ASCII character, so a candidate
+  // that has deleted half a document scores as CLEAN on every other measure --
+  // it has no artefacts, its scripts are consistent, it is entirely printable --
+  // and used to win. Without this term the ranking actively prefers the
+  // candidate that destroys the most text.
+  const substituted = Number.isInteger(options.substituted) ? options.substituted : 0;
 
   // Quality of the candidate is measured against the *original* artefact count:
   // a candidate that leaves fewer artefacts than the input made progress, and
@@ -290,6 +311,8 @@ function scoreCandidate(value, original) {
     languageHint: WEIGHTS.languageHint * hint.ratio,
     replacementChars:
       m.replacementChars > 0 ? WEIGHTS.replacementChars * m.replacementChars : 0,
+    substitutedChars:
+      substituted > 0 ? WEIGHTS.substitutedChars * substituted : 0,
   };
 
   const raw =
@@ -297,7 +320,8 @@ function scoreCandidate(value, original) {
     components.artefactDensity +
     components.printableRatio +
     components.languageHint +
-    components.replacementChars;
+    components.replacementChars +
+    components.substitutedChars;
 
   // Normalise to [0, 1] against the achievable maximum. A candidate carrying
   // replacement characters cannot go above 0, because the penalty alone exceeds
@@ -306,10 +330,13 @@ function scoreCandidate(value, original) {
 
   return {
     score: Number(score.toFixed(6)),
-    // Data loss is a veto, not a penalty.
-    eligible: m.replacementChars === 0,
+    // Data loss is a veto, not a penalty. Both forms count: U+FFFD for a byte
+    // that could not be decoded, and U+003F for a code point the codec could
+    // not represent.
+    eligible: m.replacementChars === 0 && substituted === 0,
     components,
     replacementChars: m.replacementChars,
+    substitutedChars: substituted,
     printable: Number(printable.toFixed(6)),
     consistency: Number(scripts.consistency.toFixed(6)),
     dominantScript: scripts.dominant,
@@ -346,11 +373,18 @@ function rankCandidates(candidates, original, options = {}) {
           eligible: false,
           reason: candidate.error || 'no value',
           parts: null,
+          substitutedChars: 0,
         })
       );
       continue;
     }
-    const parts = scoreCandidate(candidate.value, original);
+    const parts = scoreCandidate(candidate.value, original, {
+      // candidates.js names this `substituted`; the scorer reports it as
+      // `substitutedChars` alongside `replacementChars`. Both spellings exist
+      // because one is what the generator measured and the other is what the
+      // score breakdown publishes.
+      substituted: candidate.substituted,
+    });
     scored.push(
       Object.freeze({
         ...candidate,
@@ -359,6 +393,7 @@ function rankCandidates(candidates, original, options = {}) {
         eligible: parts.eligible,
         reason: describe(parts, candidate.value !== original),
         parts: Object.freeze(parts),
+        substitutedChars: parts.substitutedChars,
       })
     );
   }
@@ -386,8 +421,12 @@ function describe(parts, changed) {
     `artefacts ${parts.artefactCount}`,
   ];
   if (parts.hints.length) bits.push(`hints ${parts.hints.join(',')}`);
-  if (!parts.eligible) bits.push(`DISQUALIFIED: ${parts.replacementChars} replacement chars`);
-  else if (!changed) bits.push('no change');
+  if (!parts.eligible) {
+    const lost = [];
+    if (parts.replacementChars) lost.push(`${parts.replacementChars} replacement chars`);
+    if (parts.substitutedChars) lost.push(`${parts.substitutedChars} substituted chars`);
+    bits.push(`DISQUALIFIED: ${lost.join(' and ')}`);
+  } else if (!changed) bits.push('no change');
   return bits.join(', ');
 }
 

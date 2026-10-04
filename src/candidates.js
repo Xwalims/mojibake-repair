@@ -13,7 +13,7 @@
 // bad input data, because a repair tool that crashes on hostile bytes is useless
 // exactly when it is needed most.
 
-const { decode, encode, normalizeCodec } = require('./codecs.js');
+const { decode, encode, normalizeCodec, countSubstitutions } = require('./codecs.js');
 
 /**
  * The repair strategies, in the fixed order they are generated. Order is part of
@@ -122,16 +122,22 @@ function attempt(strategy, text) {
     // that are not valid UTF-8, so they are read back through latin1 (total over
     // all 256 byte values) before the strict UTF-8 decode, which is where U+FFFD
     // for unrecoverable bytes comes from.
-    const bytes = encode(text, assumed === 'utf8' ? 'latin1' : assumed);
+    const readBackAs = assumed === 'utf8' ? 'latin1' : assumed;
+    // How many characters encode() is about to destroy. Counted HERE because
+    // this is the only place the codec is known: afterwards the substituted
+    // characters are ordinary printable '?', indistinguishable from question
+    // marks the document really contained.
+    const substituted = countSubstitutions(text, readBackAs);
+    const bytes = encode(text, readBackAs);
     const value = decode(bytes, 'utf8');
     if (typeof value !== 'string') {
-      return { ok: false, error: 'decode did not produce a string' };
+      return { ok: false, error: 'decode did not produce a string', substituted };
     }
-    return { ok: true, value };
+    return { ok: true, value, substituted };
   } catch (error) {
     // An undecodable byte, an unmappable code point, a lone surrogate: all of
     // these are data problems, not programming errors. Record and move on.
-    return { ok: false, error: String((error && error.message) || error) };
+    return { ok: false, error: String((error && error.message) || error), substituted: 0 };
   }
 }
 
@@ -168,6 +174,9 @@ function generateCandidates(text, options = {}) {
         note: strategy.note,
         value: result.ok ? result.value : null,
         error: result.ok ? null : result.error,
+        // Characters this hypothesis destroys at its encode step. Carried on the
+        // candidate because only this strategy's own codec can measure it.
+        substituted: result.ok ? result.substituted : 0,
         // "changed" is informational here; the scorer decides what wins.
         changed: result.ok ? result.value !== source : false,
       })

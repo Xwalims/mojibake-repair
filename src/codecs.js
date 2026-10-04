@@ -104,6 +104,22 @@ function decode(buffer, name, options = {}) {
 }
 
 /**
+ * The byte a codec uses for a code point, or null when it cannot represent it.
+ *
+ * Shared by encode() and countSubstitutions() so the two can never disagree
+ * about what a codec can hold. If the table lookup moves, both move with it.
+ *
+ * @param {string} codec canonical codec name
+ * @param {number} cp code point
+ * @returns {number|null}
+ */
+function byteFor(codec, cp) {
+  if (codec === 'latin1') return cp <= 0xff ? cp : null;
+  const byte = ENCODE_TABLES[codec].get(cp);
+  return byte === undefined ? null : byte;
+}
+
+/**
  * Encode a string with a single-byte codec.
  *
  * Code points the codec cannot represent become U+FFFD (`lossy`, the default)
@@ -123,13 +139,8 @@ function encode(text, name, options = {}) {
   const bytes = [];
   for (const char of text) {
     const cp = char.codePointAt(0);
-    let byte;
-    if (codec === 'latin1') {
-      byte = cp <= 0xff ? cp : null;
-    } else {
-      byte = ENCODE_TABLES[codec].get(cp);
-    }
-    if (byte === undefined || byte === null) {
+    let byte = byteFor(codec, cp);
+    if (byte === null) {
       if (options.strict) {
         throw new RangeError(
           `U+${cp.toString(16).toUpperCase().padStart(4, '0')} ` +
@@ -141,6 +152,31 @@ function encode(text, name, options = {}) {
     bytes.push(byte);
   }
   return Buffer.from(bytes);
+}
+
+/**
+ * How many characters {@link encode} would replace with U+003F QUESTION MARK.
+ *
+ * This is data loss that no amount of inspecting the RESULT can reveal. Once a
+ * character has been substituted it is an ordinary printable ASCII `?`, and a
+ * document that legitimately contained question marks looks exactly the same.
+ * So the loss has to be counted where it happens -- at the encode step, by a
+ * caller that knows which codec it is using -- rather than guessed at later.
+ *
+ * `utf8` can represent everything, so it is always 0.
+ *
+ * @param {string} text
+ * @param {string} name codec that would be used
+ * @returns {number} count of code points the codec cannot hold
+ */
+function countSubstitutions(text, name) {
+  const codec = normalizeCodec(name);
+  if (codec === 'utf8') return 0;
+  let n = 0;
+  for (const char of String(text)) {
+    if (byteFor(codec, char.codePointAt(0)) === null) n += 1;
+  }
+  return n;
 }
 
 /**
@@ -171,6 +207,7 @@ function unmangle(text, name, options = {}) {
 module.exports = Object.freeze({
   CODECS,
   REPLACEMENT,
+  countSubstitutions,
   decode,
   encode,
   mojibake,
