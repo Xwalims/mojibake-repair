@@ -8,10 +8,15 @@ const {
   controlRatio,
   decodeFile,
   detectFileEncoding,
+  distinctRatio,
   ENCODINGS,
   evaluateUtf16,
   nulRatio,
   nulsByParity,
+  UTF16_MIN_BYTES,
+  UTF16_MIN_DISTINCT,
+  UTF16_MIN_GAP,
+  UTF16_MIN_SCORE,
   validateUtf8,
 } = require('../src/detect-file.js');
 const { mojibake } = require('../src/codecs.js');
@@ -111,6 +116,124 @@ test('detect-file: round-trips UTF-16 in both byte orders', () => {
     Buffer.from(text, 'utf16le').swap16(),
   ]);
   assert.equal(decodeFile(withBom), text);
+});
+
+// ---------------------------------------------------------------------------
+// Scripts whose UTF-16 code units are mostly >= U+0100, so there is little or no
+// NUL padding to measure.
+//
+// The gate was fixed at a 0.05 NUL fraction. Thai cannot reach it: every one of
+// its code units is >= U+0E00, so the buffer contains no zero bytes at all and
+// the NUL test has nothing to read. Devanagari and Arabic need no spaces to fall
+// short either -- measured 0.038 each on space-free samples -- though ordinary
+// sentences carry spaces, and a space IS zero padding in UTF-16, so a realistic
+// Arabic sentence clears 0.05 legitimately.
+// ---------------------------------------------------------------------------
+
+/**
+ * Text with no code unit below U+0100, so no NUL padding whatsoever. This is the
+ * case the fixed threshold could never reach.
+ */
+const NO_PADDING = Object.freeze({
+  thai: 'สวัสดีชาวโลก',
+  thai2: 'ประเทศไทยมีวัดที่งดงามมากมาย',
+  dev: 'नमस्तेदुनिया',
+});
+
+test('detect-file: UTF-16 with no NUL padding to measure', () => {
+  for (const [key, text] of Object.entries(NO_PADDING)) {
+    const le = Buffer.from(text, 'utf16le');
+    assert.equal(nulRatio(le), 0, `${key} must have no NUL bytes for this test to bite`);
+    assert.equal(detectFileEncoding(le).encoding, 'utf16le', `${key} LE`);
+    assert.equal(detectFileEncoding(le.swap16()).encoding, 'utf16be', `${key} BE`);
+  }
+});
+
+test('detect-file: UTF-16 whose padding falls short of the fixed threshold', () => {
+  // Devanagari without spaces: 0.038, below the 0.05 gate, but real text.
+  const dev = 'नमस्तेदुनियायहएकपरीक्षणहै';
+  assert.ok(nulRatio(Buffer.from(dev, 'utf16le')) < 0.05, 'must be below the old gate');
+  assert.equal(detectFileEncoding(Buffer.from(dev, 'utf16le')).encoding, 'utf16le');
+});
+
+test('detect-file: those files decode to the original text, not garbage', () => {
+  for (const [key, text] of Object.entries(NO_PADDING)) {
+    const le = Buffer.from(text, 'utf16le');
+    assert.equal(decodeFile(le), text, `${key} LE`);
+    assert.equal(decodeFile(le.swap16()), text, `${key} BE`);
+  }
+});
+
+test('detect-file: the no-padding path does not swallow binary or single-byte text', () => {
+  // The new arm must not claim UTF-16 for anything it has no evidence for.
+  const negatives = {
+    latin1: Buffer.from("Français: café, naïf, à côté de l'été. Ça va très bien.", 'latin1'),
+    cp1252: Buffer.from([0x93, 0x94, 0x96, 0x92, 0x80, 0x99, 0x9c, 0x8c, 0xe9, 0xfc, 0x20, 0x41, 0x20, 0x42]),
+    utf8: Buffer.from(CORRECT.ru, 'utf8'),
+    utf8cjk: Buffer.from('こんにちは世界！元気ですか。', 'utf8'),
+    binary: Buffer.from(Array.from({ length: 512 }, (_, i) => (i * 91) % 256)),
+    json: Buffer.from('{"key":"value","n":[1,2,3],"ok":true}', 'utf8'),
+  };
+  for (const [name, buffer] of Object.entries(negatives)) {
+    const result = detectFileEncoding(buffer);
+    assert.ok(
+      result.encoding !== 'utf16le' && result.encoding !== 'utf16be',
+      `${name} wrongly reported as ${result.encoding}`
+    );
+  }
+});
+
+test('detect-file: a decode made of one repeated character is not a document', () => {
+  // 64 alternating 0x41/0x00 bytes score a perfect 1.000 in one order and 0.000
+  // in the other, so score and gap alone both wave this through. It is a buffer
+  // of 32 identical "A"s, not text, and the distinct-character ratio is what
+  // says so. It does still pass the pre-existing padding arm -- this test pins
+  // the ratio helper, which is what the new arm relies on.
+  const repeated = Buffer.from('A'.repeat(32), 'utf16le');
+  assert.ok(
+    distinctRatio(repeated.toString('utf16le')) < UTF16_MIN_DISTINCT,
+    'a repeated character must fall below the threshold'
+  );
+  assert.ok(
+    distinctRatio('Привет, мир! Как дела?') > UTF16_MIN_DISTINCT,
+    'real text must clear it'
+  );
+  assert.equal(distinctRatio(''), 0, 'empty input has no distinct characters');
+});
+
+test('detect-file: the UTF-16 thresholds are consistent with what was measured', () => {
+  // These numbers come from a 73-case adversarial sweep plus nine scripts in both
+  // byte orders. The assertions keep a future edit from quietly widening them
+  // past the evidence.
+  assert.equal(UTF16_MIN_BYTES, 8, 'below 8 bytes a score of 1.000 is a coincidence');
+  assert.ok(UTF16_MIN_SCORE > 0.25, 'the worst measured negative above 8 bytes was 0.250');
+  assert.ok(UTF16_MIN_GAP <= 0.5, 'the tightest true UTF-16 gap measured was 0.500');
+  assert.ok(UTF16_MIN_DISTINCT > 0.031, 'NUL-injected ASCII sits at 0.031');
+  assert.ok(UTF16_MIN_DISTINCT < 0.4, 'the lowest true UTF-16 ratio measured was 0.400');
+});
+
+test('detect-file: scripts the plausibility test cannot judge are still refused', () => {
+  // CJK and Hangul score 0.000 in BOTH byte orders, because evaluateUtf16 counts
+  // everything above U+2FFF as implausible. There is no evidence either way, so
+  // no claim is made -- a refusal, not a wrong answer.
+  //
+  // Emoji is deliberately NOT in this list: "Hello 👋 world 🌍" scores 0.800 in
+  // one order and 0.000 in the other (the ASCII carries it), so it is genuinely
+  // decidable and must be detected rather than refused.
+  for (const text of ['こんにちは世界！元気ですか。', '你好世界！今天天气很好。', '안녕하세요 세계입니다']) {
+    for (const buffer of [Buffer.from(text, 'utf16le'), Buffer.from(text, 'utf16le').swap16()]) {
+      const result = detectFileEncoding(buffer);
+      assert.ok(
+        result.encoding !== 'utf16le' && result.encoding !== 'utf16be',
+        `undecidable text must not be guessed: got ${result.encoding}`
+      );
+    }
+  }
+
+  // And the contrast: ASCII alongside astral characters IS decidable.
+  const emoji = Buffer.from('Hello 👋 world 🌍', 'utf16le');
+  assert.equal(detectFileEncoding(emoji).encoding, 'utf16le');
+  assert.equal(detectFileEncoding(emoji.swap16()).encoding, 'utf16be');
 });
 
 test('detect-file: non-ASCII UTF-8 is not mistaken for binary', () => {

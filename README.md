@@ -505,6 +505,28 @@ decoding produces plausible text, not by NUL parity alone, because ASCII in
 UTF-16LE (`48 00 69 00`) has its NULs on the *odd* offsets and the naive rule
 reads it as big-endian.
 
+**NUL padding is a shortcut, not a test, so it cannot be the gate.** The obvious
+signal for UTF-16 is a run of NULs: ASCII in UTF-16 pads every code unit. But a
+script whose code units are all `>= U+0100` has no padding at all, and the
+proportion is per-script rather than universal — measured zero-byte fractions are
+Russian `0.11`, Hebrew `0.14`, Greek `0.10`, but Arabic `0.038`, Devanagari
+`0.038` and Thai **`0.000`**, because every Thai code unit is `>= U+0E00`. A
+fixed threshold cannot separate those: it either misses Thai entirely or admits
+binary noise. So the sniffer has two arms. Where there is padding, NUL parity is
+tested as before. Where there is none, the plausibility score is asked directly,
+and it must clear three measured bars:
+
+| Condition | Threshold | Why |
+| --- | --- | --- |
+| score | `0.60` | Every true UTF-16 document scores `1.000` in its own order except an emoji sample at `0.719`; 73 adversarial negatives (latin1 prose, cp1252 byte soup, full-range soup, arithmetic sequences, UTF-8 in twelve scripts, JSON, NUL noise, 1–512 bytes) reached at most `0.250` |
+| gap between orders | `0.25` | The score has to *decide* the byte order; every true document separates by at least `0.500` |
+| distinct characters | `0.15` | NUL-injected ASCII scores a perfect `1.000` with a gap of `1.000`, but decodes to 32 identical `A`s — a distinct ratio of `0.031`. Real text measures `0.400`–`1.000` |
+
+A document the score genuinely cannot judge is **refused, not guessed**: CJK,
+Hangul and pure emoji score `0.000` in both orders, because `evaluateUtf16`
+treats everything above `U+2FFF` as implausible. Those keep whatever verdict the
+later steps reach, which is the honest answer — the bytes genuinely do not say.
+
 ---
 
 ## Tests
@@ -513,7 +535,7 @@ reads it as big-endian.
 npm test        # node --test
 ```
 
-338 tests across 11 files, built on `node:test` and `node:assert` with no test
+362 tests across 11 files, built on `node:test` and `node:assert` with no test
 framework. Broken samples are **generated** by encoding correct text through the
 wrong codec, so every true-positive test is self-proving: the expected value is
 the original string, and a test can only pass if the tool reverses the same

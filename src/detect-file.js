@@ -24,6 +24,62 @@ const BOMS = Object.freeze([
 const ENCODINGS = Object.freeze(['utf8', 'utf16le', 'utf16be', 'latin1', 'binary']);
 
 /**
+ * Minimum buffer size before a UTF-16 plausibility score may be trusted on its
+ * own. Measured: a two-byte buffer scores 1.000, because a single UTF-16 code
+ * unit is 100% plausible by definition -- 0x61 0x00 is "a" and 0x00 0x61 is a
+ * CJK-extension character, and each is judged alone. Three bytes do the same.
+ * The first non-trivial negatives appear at 5 bytes (0.250) and 6 bytes (0.500),
+ * and from 7 bytes up every latin1, cp1252, UTF-8 and binary sample measured
+ * scores 0.000 except a 37-byte JSON document at 0.250.
+ */
+const UTF16_MIN_BYTES = 8;
+
+/**
+ * Minimum plausibility score for the correct byte order, when the NUL-padding
+ * signal is unavailable. Measured against 73 adversarial negatives (latin1
+ * prose, cp1252 byte soup, full-range soup, arithmetic sequences, UTF-8 in
+ * twelve scripts, JSON, NUL noise, buffers of 1-512 bytes): the highest score any
+ * of them reached at or above UTF16_MIN_BYTES was 0.250.
+ */
+const UTF16_MIN_SCORE = 0.6;
+
+/**
+ * Minimum gap between the two byte-order scores.
+ *
+ * The score decides *which* order, so a coin-flip must not be reported as a
+ * decision. Every true UTF-16 document measured separates by at least 0.500.
+ */
+const UTF16_MIN_GAP = 0.25;
+
+/**
+ * Minimum fraction of distinct characters in the winning decode.
+ *
+ * Rejects the one negative that scores perfectly: NUL-injected ASCII. 64
+ * alternating 0x41/0x00 bytes decode to 32 identical "A"s -- score 1.000 in one
+ * order, 0.000 in the other, so score and gap both wave it through -- but the
+ * distinct-character ratio is 0.031. Measured true UTF-16 minimum across nine
+ * scripts: 0.400 (Arabic); the Thai sample sits at 0.833.
+ */
+const UTF16_MIN_DISTINCT = 0.15;
+
+/**
+ * Fraction of characters in a string that are distinct from each other.
+ *
+ * Not a text-quality heuristic: it counts distinct code points, so a document
+ * in a script this module cannot classify still scores high. It exists to
+ * separate "a document" from "one character repeated", which no byte-class
+ * signal distinguishes.
+ *
+ * @param {string} text
+ * @returns {number} in [0, 1]; 0 for empty input
+ */
+function distinctRatio(text) {
+  const chars = [...String(text)];
+  if (chars.length === 0) return 0;
+  return new Set(chars).size / chars.length;
+}
+
+/**
  * Does a buffer start with these bytes?
  * @param {Buffer} buffer
  * @param {readonly number[]} bytes
@@ -198,6 +254,7 @@ function detectFileEncoding(input) {
 
   const nul = nulRatio(buffer);
   const control = controlRatio(buffer);
+  const binaryish = binaryControlRatio(buffer);
 
   // 1. A BOM is a declaration from whoever wrote the file. Trust it outright.
   for (const [bytes, name] of BOMS) {
@@ -223,54 +280,89 @@ function detectFileEncoding(input) {
   //    what actually decides, and it gets ASCII right because UTF-16LE then
   //    yields "Hi" while UTF-16BE yields unassigned characters.
   // NULs clustered on one parity is the UTF-16 signature, whatever the overall
-  // NUL fraction: Russian or Japanese in UTF-16 has fewer NULs than ASCII in
-  // UTF-16 (the high bytes are real characters, not padding) but the parity
-  // pattern is just as clear, so the threshold cannot be a fixed byte fraction.
+  // NUL fraction. The gate is therefore `nul > 0`, NOT a fixed byte fraction.
+  //
+  // It used to be `nul >= 0.05`, which contradicted this comment: for any script
+  // whose UTF-16 code units are mostly >= U+0100 there is little or no NUL
+  // padding at all, so the fraction has nothing to read and the file falls
+  // through to "binary" and is decoded as latin1 garbage. Measured proportions of
+  // zero bytes in a UTF-16 buffer: Russian 0.11, Hebrew 0.14, Greek 0.10, but
+  // Arabic 0.038, Devanagari 0.038 and Thai 0.000 -- Devanagari has ONE zero
+  // byte in thirteen code units. Those three are all real text and all were
+  // being missed.
+  //
+  // A bare `nul > 0` is not enough: a binary file whose NULs happen to land on
+  // one parity satisfies it (measured: two 512-byte arithmetic sequences at
+  // nul=0.003 with clustering 1.0). So the padding arm keeps the 0.05 floor it
+  // always had, and the NEW capability arrives as a separate arm below.
   const paritySplit = nulsByParity(buffer);
-  const clustered = Math.max(paritySplit.even, paritySplit.odd) / Math.max(paritySplit.even + paritySplit.odd, 1);
-  if (nul >= 0.05 && clustered >= 0.8) {
+  const clustered =
+    Math.max(paritySplit.even, paritySplit.odd) / Math.max(paritySplit.even + paritySplit.odd, 1);
+  const padded = nul >= 0.05 && clustered >= 0.8;
+  // The second arm exists for the scripts that have no padding to measure: a
+  // document whose UTF-16 code units are all >= U+0100. It is consulted only
+  // when the buffer is big enough for a score to mean anything, and it must then
+  // pass on its own merits -- there is no parity to fall back on, so a weak
+  // result declines to claim UTF-16 at all.
+  const scorable = size >= UTF16_MIN_BYTES;
+  if (padded || scorable) {
     const as = evaluateUtf16(buffer, 'utf16le');
     const bs = evaluateUtf16(buffer, 'utf16be');
-    const winner = as.score >= bs.score ? as : bs;
-    const loser = as.score >= bs.score ? bs : as;
-    // NUL parity breaks the tie, and it is only consulted when the text score
-    // cannot: for ASCII the two orders decode to equally plausible-looking
-    // output, and only the padding position distinguishes them.
-    const tieBrokenByParity = as.score === bs.score;
-    // In UTF-16LE the significant byte comes first and the zero padding lands on
-    // the ODD offset, so "more NULs on odd offsets" means little-endian. (For
-    // non-Latin text there is no padding at all, which is why this is only a
-    // tie-break and never the primary test.)
-    const winnerEncoding =
-      tieBrokenByParity
-        ? paritySplit.odd >= paritySplit.even
-          ? 'utf16le'
-          : 'utf16be'
-        : winner.encoding;
-    const decided = winnerEncoding === winner.encoding ? winner : (winnerEncoding === 'utf16le' ? as : bs);
-    const other = winnerEncoding === 'utf16le' ? bs : as;
-    const decisive = winnerEncoding === winner.encoding;
-    return Object.freeze({
-      encoding: decided.encoding,
-      bom: null,
-      confidence: Number(
-        (decisive ? Math.min(0.7 + decided.score * 0.3, 0.99) : 0.6).toFixed(4)
-      ),
-      size,
-      reason:
-        `${(nul * 100).toFixed(0)}% NUL bytes clustered on the ` +
-        `${paritySplit.odd >= paritySplit.even ? 'odd' : 'even'} offsets; decoding as ` +
-        `${decided.encoding} scores ${decided.score.toFixed(2)} vs ${other.score.toFixed(2)} ` +
-        `for ${other.encoding}${tieBrokenByParity ? ' (tie, broken by NUL position)' : ''}`,
-      nulRatio: nul,
-      controlRatio: control,
-      utf8Valid: false,
-    });
+    const gap = Math.abs(as.score - bs.score);
+    const best = as.score >= bs.score ? as : bs;
+    // Three conditions, all measured rather than guessed:
+    //
+    //   score >= 0.6  admits a real document. Measured: every true UTF-16 file
+    //     scores 1.000 in its own order except an emoji sample at 0.719, while
+    //     all 73 adversarial negatives (latin1 prose, cp1252 soup, full-range
+    //     soup, arithmetic sequences, UTF-8 in twelve scripts, JSON, NUL noise,
+    //     buffers of 1-512 bytes) reached at most 0.250 at or above
+    //     UTF16_MIN_BYTES.
+    //   gap  >= 0.25  the score must DECIDE the byte order. Every true UTF-16
+    //     file measured separates by at least 0.500.
+    //   distinctness  a decode made almost entirely of one repeated character is
+    //     not a document. This is what stops NUL-injected ASCII from taking the
+    //     new arm: 64 alternating 0x41/0x00 bytes decode to 32 identical "A"s
+    //     with a score of 1.000 and a gap of 1.000, so score and gap alone both
+    //     wave it through. Its distinct-character ratio is 0.031.
+    //
+    // Measured true UTF-16 distinctness minimum across nine scripts: 0.400
+    // (Arabic). The threshold is well below that and far above 0.031.
+    const distinct = distinctRatio(best.text);
+    const scoreDecides =
+      gap >= UTF16_MIN_GAP && best.score >= UTF16_MIN_SCORE && distinct >= UTF16_MIN_DISTINCT;
+    const winnerEncoding = scoreDecides
+      ? best.encoding
+      : padded
+        ? (paritySplit.odd >= paritySplit.even ? 'utf16le' : 'utf16be')
+        : null;
+    if (winnerEncoding === null) {
+      // Indistinguishable from single-byte text: let the later steps classify it.
+    } else {
+      const decided = winnerEncoding === 'utf16le' ? as : bs;
+      const other = winnerEncoding === 'utf16le' ? bs : as;
+      const decisive = winnerEncoding === best.encoding;
+      return Object.freeze({
+        encoding: decided.encoding,
+        bom: null,
+        confidence: Number(
+          (decisive ? Math.min(0.7 + decided.score * 0.3, 0.99) : 0.6).toFixed(4)
+        ),
+        size,
+        reason:
+          `${(nul * 100).toFixed(0)}% NUL bytes clustered on the ` +
+          `${paritySplit.odd >= paritySplit.even ? 'odd' : 'even'} offsets; decoding as ` +
+          `${decided.encoding} scores ${decided.score.toFixed(2)} vs ${other.score.toFixed(2)} ` +
+          `for ${other.encoding}${scoreDecides ? '' : ' (tie, broken by NUL position)'}`,
+        nulRatio: nul,
+        controlRatio: control,
+        utf8Valid: false,
+      });
+    }
   }
 
   // 3. Mostly non-printable bytes with no UTF-16 NUL structure: not text at all,
   //    so there is no text-encoding problem to report.
-  const binaryish = binaryControlRatio(buffer);
   if (binaryish > 0.3) {
     return Object.freeze({
       encoding: 'binary',
@@ -486,8 +578,13 @@ function swapPairs(buffer) {
 module.exports = Object.freeze({
   BOMS,
   ENCODINGS,
+  UTF16_MIN_BYTES,
+  UTF16_MIN_DISTINCT,
+  UTF16_MIN_GAP,
+  UTF16_MIN_SCORE,
   binaryControlRatio,
   controlRatio,
+  distinctRatio,
   evaluateUtf16,
   decodeFile,
   detectFileEncoding,
