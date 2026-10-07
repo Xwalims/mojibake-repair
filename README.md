@@ -535,7 +535,7 @@ later steps reach, which is the honest answer — the bytes genuinely do not say
 npm test        # node --test
 ```
 
-362 tests across 11 files, built on `node:test` and `node:assert` with no test
+368 tests across 13 files, built on `node:test` and `node:assert` with no test
 framework. Broken samples are **generated** by encoding correct text through the
 wrong codec, so every true-positive test is self-proving: the expected value is
 the original string, and a test can only pass if the tool reverses the same
