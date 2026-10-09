@@ -24,9 +24,16 @@
  *
  * ## What a segment is
  *
- * A run of lines that share one winning codec. Grouping happens after scoring,
- * so a document alternating every line between two codecs still collapses to
- * two segments rather than one segment per line.
+ * A run of consecutive lines that share one winning codec. Grouping happens
+ * after scoring, so lines broken through the same codec and placed together
+ * form ONE segment however short each line is -- but a document that alternates
+ * codecs on every line yields one segment per line, because merging across a run
+ * boundary would apply a single codec to lines the evidence does not support.
+ *
+ * The per-line decision is what finds the runs; the segment is the unit that
+ * gets repaired. A line too short to detect on its own therefore need not be
+ * lost: it is repaired by the block around it, which is the whole reason this
+ * module exists instead of a loop over lines. See `repairMixed()`.
  */
 
 /**
@@ -53,20 +60,58 @@ function splitLines(text) {
 /**
  * Group consecutive lines that resolved to the same codec.
  *
- * @param {Array<{content: string, eol: string, id: string}>} lines
- * @returns {Array<{id: string, lines: Array<{content: string, eol: string}>}>}
+ * Only ADJACENT lines sharing an id are merged. A document that alternates
+ * codecs on every line therefore yields one segment per line, while a document
+ * broken in runs collapses to one segment per run. That is deliberate: a
+ * segment is a run of lines, and merging across a run boundary would apply one
+ * codec to lines the evidence does not support.
+ *
+ * The WHOLE line object is stored, not just its text. `id` and `value` are what
+ * let repairMixed() fall back to per-line repairs when a segment cannot be
+ * repaired as a unit. Discarding them made that fallback dead code -- every
+ * `l.id === seg.id` test compared `undefined` against a codec name and so was
+ * always false -- which meant a segment that failed the unit test kept its
+ * BROKEN bytes even for the lines it had already repaired individually.
+ *
+ * @param {Array<{content: string, eol: string, id: string|null, value?: string}>} lines
+ * @returns {Array<{id: string|null, lines: Array<object>}>}
  */
 function groupSegments(lines) {
   const segments = [];
   for (const line of lines) {
     const last = segments[segments.length - 1];
     if (last && last.id === line.id) {
-      last.lines.push({ content: line.content, eol: line.eol });
+      last.lines.push(line);
     } else {
-      segments.push({ id: line.id, lines: [{ content: line.content, eol: line.eol }] });
+      segments.push({ id: line.id, lines: [line] });
     }
   }
   return segments;
+}
+
+/**
+ * Merge neighbouring segments that ended up with the same id.
+ *
+ * `absorbUnchanged()` gives a leading block of undecided lines the id of the
+ * first decided segment. When that block is immediately followed by a segment
+ * which already had that id, absorption creates two adjacent segments carrying
+ * the same codec -- a split the caller never asked for and cannot see the
+ * reason for. Re-merging here keeps "a segment is a run of lines" true.
+ *
+ * @param {Array<{id: string|null, lines: Array<object>}>} segments
+ * @returns {Array<{id: string|null, lines: Array<object>}>}
+ */
+function mergeAdjacent(segments) {
+  const out = [];
+  for (const seg of segments) {
+    const prev = out[out.length - 1];
+    if (prev && prev.id === seg.id) {
+      prev.lines = prev.lines.concat(seg.lines);
+      continue;
+    }
+    out.push({ id: seg.id, lines: seg.lines.slice() });
+  }
+  return out;
 }
 
 /**
@@ -107,5 +152,6 @@ function absorbUnchanged(segments) {
 module.exports = Object.freeze({
   splitLines,
   groupSegments,
+  mergeAdjacent,
   absorbUnchanged,
 });

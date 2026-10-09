@@ -22,7 +22,8 @@
 const { generateCandidates, STRATEGY_BY_ID, STRATEGY_IDS } = require('./candidates.js');
 const { looksMojibake, THRESHOLDS } = require('./detect.js');
 const { DEFAULT_MIN_SCORE, rankCandidates } = require('./score.js');
-const { splitLines, groupSegments, absorbUnchanged } = require('./segments.js');
+const { encode } = require('./codecs.js');
+const { splitLines, groupSegments, mergeAdjacent, absorbUnchanged } = require('./segments.js');
 
 /**
  * Every option with its default, in one frozen object. Defaults live here and
@@ -252,6 +253,66 @@ function strategyAssumes(id, encoding) {
 }
 
 /**
+ * Whether a segment may adopt the codec the unit repair chose.
+ *
+ * The question this answers is "does the unit repair contradict anything the
+ * segment's own lines actually decided?" -- and `seg.id` is the wrong thing to
+ * ask it with. By the time a segment reaches here its id may be a label that
+ * `absorbUnchanged()` invented for a block of undecided lines, or one
+ * `mergeAdjacent()` stitched on. Those are bookkeeping, not evidence, and
+ * comparing a codec name against them throws away a correct repair.
+ *
+ * It did exactly that. A block of French broken through cp1252 whose leading
+ * lines were too short to detect on their own had its id inherited from the one
+ * line that was detected -- `latin1`, the tie-break winner among two codecs that
+ * disagree only across 0x80-0x9F. The unit repair over the joined block
+ * correctly named `cp1252` and produced the right text; the name check rejected
+ * it, and the fallback then kept only the lines whose own id matched, so the
+ * whole segment came back broken.
+ *
+ * So the evidence is taken from the lines themselves: for every line that was
+ * DECIDED on its own, the unit codec must either be the same or produce the same
+ * bytes for that line. Undecided lines carry no evidence and do not object.
+ * Byte-equality is the right test rather than name-equality because the two
+ * Western codecs really are the same codec on most text -- when a line contains
+ * no C1-range character they cannot disagree, and the per-line result stands
+ * whichever name is used.
+ *
+ * When a decided line DOES contradict the unit repair -- genuinely different
+ * codecs, different bytes for that line -- the unit repair is not allowed to
+ * override it, and the caller keeps the per-line results instead.
+ *
+ * @param {ReadonlyArray<{id: string|null}>} lines the segment's lines
+ * @param {string|null} unitEncoding codec the unit repair chose
+ * @returns {boolean}
+ */
+function agreesWithLines(lines, unitEncoding) {
+  if (unitEncoding === null) return false;
+  for (const line of lines) {
+    if (line.id === null) continue; // undecided: no evidence either way
+    if (line.id === unitEncoding) continue;
+    if (!sameBytesFor(line.content, line.id, unitEncoding)) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether two codecs encode this text to identical bytes.
+ *
+ * @param {string} text
+ * @param {string} a canonical codec name
+ * @param {string} b canonical codec name
+ * @returns {boolean}
+ */
+function sameBytesFor(text, a, b) {
+  try {
+    return encode(text, a).equals(encode(text, b));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Explain, in one sentence, why nothing was repaired. Picks the most informative
  * failure across the candidate pool.
  *
@@ -413,13 +474,28 @@ function repairMixed(text, options = {}) {
 
   // An ASCII line repairs to itself under every codec, so its "winner" is
   // arbitrary. Give those lines to their neighbours instead of letting them
-  // split the document into meaningless segments.
-  const grouped = absorbUnchanged(
-    groupSegments(decided).map((seg) => ({
-      id: seg.id,
-      lines: seg.lines,
-      unchanged: seg.id === null,
-    }))
+  // split the document into meaningless segments. Absorption can leave a block
+  // abutting a segment that already had the id it was handed, so the result is
+  // re-merged: a segment is a RUN of lines, and two adjacent runs of the same
+  // codec are one run.
+  //
+  // Only PURE ASCII absorbs, and that restriction is load-bearing. A line that
+  // is non-ASCII but undecided is not codec-neutral: it is a broken line too
+  // short to carry enough signal to be detected on its own. Letting it adopt a
+  // neighbour's codec hands it a decision made by a different script's
+  // evidence, and the result is worse than useless -- French lines absorbed
+  // into a Russian cp1251 segment were repaired *as Cyrillic*, which is exactly
+  // the damage this whole module exists to prevent. Such lines stay in their own
+  // segment and get the block repair below, which is the mechanism built for
+  // them.
+  const grouped = mergeAdjacent(
+    absorbUnchanged(
+      groupSegments(decided).map((seg) => ({
+        id: seg.id,
+        lines: seg.lines,
+        unchanged: seg.id === null && seg.lines.every((l) => !/[^\x00-\x7f]/.test(l.content)),
+      }))
+    )
   );
 
   const segments = [];
@@ -428,41 +504,66 @@ function repairMixed(text, options = {}) {
   let refusedSegments = 0;
 
   for (const seg of grouped) {
-    if (seg.id === null) {
-      // No confident codec for this run of lines: keep the original bytes.
-      refusedSegments += 1;
-      const text0 = seg.lines.map((l) => l.content + l.eol).join('');
-      segments.push({
-        encoding: null,
-        lines: seg.lines.length,
-        changed: false,
-        reason: 'no codec repaired this segment confidently; left unchanged',
-      });
-      out += text0;
-      continue;
-    }
+    const raw = seg.lines.map((l) => l.content + l.eol).join('');
 
     // Re-run the whole segment under the codec that won for its lines. Scoring a
     // segment as a unit rather than line by line is what makes a two-line French
     // paragraph recoverable: one French line may not carry enough signal alone.
-    const raw = seg.lines.map((l) => l.content + l.eol).join('');
+    //
+    // A segment with no id has no winner to test, but it still gets the attempt.
+    // Refusing it outright skipped the one mechanism that exists for lines too
+    // short to be judged individually, and left them broken while their
+    // neighbours were repaired. The block is only accepted when the whole of it
+    // repairs confidently, which cannot fire on correct text: a clean block
+    // scores zero and is refused.
     const joined = repair(raw, opts);
-    const useSegment =
-      joined.confident && joined.changed && joined.encoding === seg.id
-        ? joined.value
-        : seg.lines.map((l) => (l.id === seg.id ? l.value : l.content) + l.eol).join('');
+    const segmentDecides =
+      seg.id !== null
+        ? joined.confident && joined.changed && agreesWithLines(seg.lines, joined.encoding)
+        : joined.confident && joined.changed;
 
-    if (useSegment !== raw) repairedSegments += 1;
+    if (!segmentDecides) {
+      if (seg.id === null) {
+        // No confident codec for this run of lines: keep the original bytes.
+        refusedSegments += 1;
+        segments.push({
+          encoding: null,
+          lines: seg.lines.length,
+          changed: false,
+          reason: 'no codec repaired this segment confidently; left unchanged',
+        });
+        out += raw;
+        continue;
+      }
+      // The unit repair did not carry the segment. Keep each line's own result,
+      // which is at least as good as the input: a line repaired individually
+      // stays repaired, and a line that could not be stays byte-identical.
+      const perLine = seg.lines.map((l) => (l.id === seg.id ? l.value : l.content) + l.eol).join('');
+      if (perLine !== raw) repairedSegments += 1;
+      segments.push({
+        encoding: seg.id,
+        lines: seg.lines.length,
+        changed: perLine !== raw,
+        reason:
+          perLine === raw
+            ? 'segment repaired to an identical value; left unchanged'
+            : `repaired as ${seg.id} line by line`,
+      });
+      out += perLine;
+      continue;
+    }
+
+    if (joined.value !== raw) repairedSegments += 1;
     segments.push({
-      encoding: seg.id,
+      encoding: seg.id === null ? joined.encoding : seg.id,
       lines: seg.lines.length,
-      changed: useSegment !== raw,
+      changed: joined.value !== raw,
       reason:
-        useSegment === raw
+        joined.value === raw
           ? 'segment repaired to an identical value; left unchanged'
-          : `repaired as ${seg.id}`,
+          : `repaired as ${seg.id === null ? joined.encoding : seg.id}`,
     });
-    out += useSegment;
+    out += joined.value;
   }
 
   const changed = out !== original;

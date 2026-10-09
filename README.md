@@ -454,13 +454,30 @@ winning codec. Three details matter:
 
 - **Grouping happens after scoring, not before.** Lines are decided individually
   and runs of the same winner are merged, so a paragraph broken through one codec
-  stays one segment instead of one segment per line.
+  stays one segment instead of one segment per line. The reverse is also true and
+  deliberate: a document alternating codecs on every line keeps one segment per
+  run, because merging across a run boundary would apply one codec to lines the
+  evidence does not support.
 - **A segment is only rewritten when its own repair is confident.** A run of
   lines that no single codec explains is left byte-identical and reported as
   refused. The worst case is the input unchanged — never worse.
 - **ASCII lines adopt a neighbour.** Pure ASCII breaks identically through every
   codec, so its "winner" is arbitrary; those lines join the neighbouring segment
-  instead of fragmenting the document.
+  instead of fragmenting the document. Only *pure* ASCII qualifies. A non-ASCII
+  line that is undecided is a broken line too short to detect on its own, not a
+  neutral one, so it keeps its own segment and is repaired by the block around
+  it rather than adopting a codec another script's evidence picked.
+- **A segment gets one repair attempt as a block.** This is what recovers a
+  short line: `"Ça va"` carries a single artefact pair, below the two-pair
+  detection guard, and is left alone by `repair()` on its own — but joined with
+  its neighbours it carries enough signal and comes back correct. The block is
+  only accepted when the whole of it repairs confidently, which cannot happen on
+  correct text.
+
+One limit worth stating plainly: a single undetectable line wedged between two
+*different* scripts stays broken. Its neighbours disagree about which codec it
+broke through, no block containing it is monolingual, and it is reported as
+refused rather than guessed.
 
 `--mixed` is additive, not a fix. Without it the same file is still refused
 byte-identical, and `repair()`'s refusal is what the default path depends on.
