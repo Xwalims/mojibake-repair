@@ -294,19 +294,45 @@ threshold.
 
 ### The thresholds are measured, not guessed
 
-The separation each threshold sits in, taken from the calibration corpus:
+The separation each threshold sits in, measured over this project's own corpus
+(`test/fixtures.js`: `MUST_NOT_CHANGE` plus every `CORRECT` fixture broken
+through each of latin1, cp1251 and cp1252 — 57 correct and 69 broken strings).
+Every number below is reproduced by `test/detect.test.js`, which fails if the
+measurements move.
 
 | Signal | Correct text (max) | Broken text (min) | Threshold |
 | --- | --- | --- | --- |
-| `utf8-pair` ratio | 0.100 (German `Maß»`) | 0.947 | **0.50** |
-| `utf8-pair` count | 1 | 20 | **2** |
-| `c1-control` ratio | 0.000 | 0.063 | **0.02** |
-| `cyrillic-extras` ratio | 0.206 (Serbian) | 0.333 | **0.26** |
+| `utf8-pair` ratio | 1.000 (`Maß»`) | 0.667 (Japanese/cp1252) | **0.50** |
+| `utf8-pair` count | 1 | 6 | **2** |
+| `c1-control` ratio | 0.000 | 0.014 (Greek/cp1252) | **0.02** |
+| `cyrillic-extras` ratio | 0.206 (Serbian) | 0.200 (French/cp1251) | **0.26** |
 
-`Maß»` is the case that matters: correct German really does contain a lead byte
-next to a continuation character. It is not saved by a smarter definition — it is
-saved by requiring **two** pairs and a **ratio**, where it scores 1 and 0.10
-against thresholds of 2 and 0.50.
+**Only the count guard protects `Maß»`, not the ratio.** The earlier version of
+this table claimed `Maß»` scored a ratio of 0.10 and was saved by both guards.
+It does not: `Maß»` is two non-ASCII characters carrying exactly one pair, so
+its ratio is `1.000` — far *above* the 0.50 threshold. It is saved by the
+**≥2 pairs** requirement alone. The 0.10 figure is the ratio of the full German
+fixture, a different string. Correct text really does contain lead bytes next
+to continuation characters, and the count guard is the only thing standing
+between that and a false positive on every German document.
+
+### Two thresholds sit outside a gap, and the table says so
+
+The honest reading of the table is that **not every threshold separates**:
+
+- **`cyrillic-extras` has no gap at all.** Broken text bottoms out at 0.200
+  (French through cp1251) while correct Serbian reaches 0.206 — the populations
+  *overlap*. No threshold can separate them, and 0.26 sits above both, so it
+  trades a false positive for a false negative: the two fixtures it misses are
+  French and Arabic broken through cp1251, which score 0.200 and 0.242 and are
+  therefore **not detected at all**. Lowering the threshold below 0.206 would
+  flag correct Serbian, Macedonian and Ukrainian prose, which is exactly the
+  damage this detector exists to avoid. Detection of short non-Russian text
+  broken through cp1251 is a known limitation, not a tuned-away problem.
+- **`c1-control` is similarly marginal.** Broken text reaches only 0.014 here,
+  just under its own 0.02 threshold, so on this corpus the signal never fires
+  on broken text by itself; it carries weight for inputs that reach it through
+  other damage rather than as a primary detector.
 
 ### Why bigrams, not characters
 

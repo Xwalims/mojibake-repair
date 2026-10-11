@@ -106,8 +106,13 @@ test('score: artefactDensity is ~0 for correct text and positive for broken text
   // Languages that genuinely use windows-1251's 0x80-0xBF block, so their correct
   // text registers padding-letter hits: Ukrainian (ї є ґ), Macedonian and Serbian
   // (ѕ ј ќ џ, ђ љ њ ћ). Their measured ratios are 0.146, 0.189 and 0.206 -- all
-  // below the 0.26 threshold, and well below the 0.333 that cp1251 mojibake
-  // produces. The ratio is what separates them, never the presence.
+  // below the 0.26 threshold. The ratio is what separates them, never the presence.
+  //
+  // Note that this is NOT a clean gap: cp1251-broken French bottoms out at
+  // 0.200, BELOW correct Serbian's 0.206, so the populations overlap and the
+  // threshold really does buy a false negative. It buys it deliberately -- going
+  // lower would flag correct prose -- and test/detect.test.js pins both numbers
+  // so the trade cannot be quietly rewritten.
   const usesPaddingLetters = new Set(['uk', 'mk', 'sr']);
   for (const key of ['fr', 'es', 'pt', 'tr', 'ru', 'bg', 'en', 'emoji', 'math']) {
     const { count } = artefactDensity(CORRECT[key]);
